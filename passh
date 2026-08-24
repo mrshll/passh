@@ -43,7 +43,12 @@ USAGE = """passh — the 1Password CLI, run where the biometrics are.
 Prefer `passh run` over `passh read`: it keeps secret values out of your
 terminal, your shell history, and any agent's conversation context.
 
-Env: PASSH_PORT, PASSH_OP, PASSH_TOKEN_FILE, PASSH_FORCE_REMOTE
+If the tunnel is down (mobile SSH client, laptop asleep, tmux session
+outliving its SSH session), passh falls back to op on this machine, which
+asks for your 1Password password instead of Touch ID.
+
+Env: PASSH_PORT, PASSH_OP, PASSH_TOKEN_FILE,
+     PASSH_MODE=local|remote, PASSH_NO_FALLBACK=1
 """
 
 
@@ -52,10 +57,43 @@ def die(msg: str, code: int = 1) -> "NoReturn":  # noqa: F821
     raise SystemExit(code)
 
 
-def is_remote() -> bool:
+class TunnelDown(Exception):
+    """The tunnel is not answering — the laptop is unreachable right now."""
+
+
+def resolve_mode() -> str:
+    """'local' or 'remote'. Remote may still fall back; see op_exec."""
+    forced = os.environ.get("PASSH_MODE", "").strip().lower()
+    if forced in ("local", "remote"):
+        return forced
+    if forced:
+        die(f"PASSH_MODE must be 'local' or 'remote', not {forced!r}")
     if os.environ.get("PASSH_FORCE_REMOTE"):
-        return True
-    return platform.system() != "Darwin"
+        return "remote"
+    return "local" if platform.system() == "Darwin" else "remote"
+
+
+def is_remote() -> bool:
+    return resolve_mode() == "remote"
+
+
+_warned = False
+
+
+def warn_fallback(reason: str) -> None:
+    """Say why we stopped using the tunnel — once, no matter how many calls."""
+    global _warned
+    if _warned:
+        return
+    _warned = True
+    print(f"passh: no tunnel to the laptop ({reason}).", file=sys.stderr)
+    print("       Falling back to op on this machine.", file=sys.stderr)
+    needs_password = platform.system() != "Darwin"
+    if needs_password and not sys.stdin.isatty() and not any(
+        k.startswith("OP_SESSION_") for k in os.environ
+    ):
+        print("       This needs a password prompt and there is no terminal here,", file=sys.stderr)
+        print("       so it will fail. Run `eval $(op signin)` in your shell first.", file=sys.stderr)
 
 
 def check_blocked(args: list[str]) -> None:
@@ -72,17 +110,40 @@ def check_blocked(args: list[str]) -> None:
         die(f"'{name}' is blocked. Run it on the Mac directly if you really mean it.")
 
 
+def run_local(args: list[str], stdin: bytes | None, fallback: bool = False) -> tuple[int, bytes, bytes]:
+    env = dict(os.environ)
+    if fallback and platform.system() != "Darwin":
+        # Without this, op on a headless box tries the desktop app and dies with
+        # "cannot connect to 1Password app". Off, it asks for the password here.
+        # Only on non-macOS: where the app genuinely works, let op use it.
+        env["OP_BIOMETRIC_UNLOCK_ENABLED"] = "false"
+    try:
+        proc = subprocess.run([LOCAL_OP, *args], input=stdin, capture_output=True, env=env)
+    except FileNotFoundError:
+        die(f"{LOCAL_OP} not found on PATH")
+    return proc.returncode, proc.stdout, proc.stderr
+
+
 def op_exec(args: list[str], stdin: bytes | None = None) -> tuple[int, bytes, bytes]:
-    """Run op locally or through the tunnel. Returns (rc, stdout, stderr)."""
-    check_blocked(args)
-
+    """Run op through the tunnel, or locally if there is no tunnel to use."""
     if not is_remote():
-        try:
-            proc = subprocess.run([LOCAL_OP, *args], input=stdin, capture_output=True)
-        except FileNotFoundError:
-            die(f"{LOCAL_OP} not found on PATH")
-        return proc.returncode, proc.stdout, proc.stderr
+        # No blocklist here. It exists to limit what the tunnel exposes to a
+        # remote machine; locally you could just run `op` yourself, so refusing
+        # would buy nothing and would block the `passh signin` you need to
+        # authenticate in fallback mode.
+        return run_local(args, stdin)
 
+    check_blocked(args)
+    try:
+        return run_remote(args, stdin)
+    except TunnelDown as exc:
+        if os.environ.get("PASSH_NO_FALLBACK"):
+            die(f"no tunnel to the laptop ({exc}) and PASSH_NO_FALLBACK is set")
+        warn_fallback(str(exc))
+        return run_local(args, stdin, fallback=True)
+
+
+def run_remote(args: list[str], stdin: bytes | None) -> tuple[int, bytes, bytes]:
     try:
         token = TOKEN_PATH.read_text().strip()
     except OSError:
@@ -115,12 +176,7 @@ def op_exec(args: list[str], stdin: bytes | None = None) -> tuple[int, bytes, by
                 "       Re-copy ~/.config/passh/token from the Mac.")
         die(f"passhd returned {exc.code}: {detail}")
     except urllib.error.URLError as exc:
-        die(
-            f"cannot reach passhd on 127.0.0.1:{PORT} ({exc.reason}).\n"
-            "       The tunnel rides your SSH session from the Mac. Is that session\n"
-            "       still open, and does its ssh config carry:\n"
-            f"           RemoteForward {PORT} 127.0.0.1:{PORT}"
-        )
+        raise TunnelDown(str(exc.reason)) from exc
     return (
         int(body["rc"]),
         base64.b64decode(body["stdout"]),
@@ -254,25 +310,50 @@ def cmd_inject(argv: list[str]) -> int:
 
 
 def cmd_doctor() -> int:
-    if not is_remote():
-        print("mode:     local (macOS — using the op on this machine)")
+    mode = resolve_mode()
+    if mode == "local":
+        where = "macOS" if platform.system() == "Darwin" else "forced by PASSH_MODE"
+        print(f"mode:     local ({where}) — using the op on this machine")
         print(f"op:       {LOCAL_OP}")
         return passthrough(["account", "list"])
 
-    print(f"mode:     remote -> passhd on 127.0.0.1:{PORT} (tunnelled to the Mac)")
+    print(f"mode:     remote -> passhd on 127.0.0.1:{PORT} (tunnelled to the laptop)")
     print(f"token:    {TOKEN_PATH} {'found' if TOKEN_PATH.exists() else 'MISSING'}")
-    rc, out, err = op_exec(["--version"])
+
+    try:
+        rc, out, err = run_remote(["--version"], None)
+    except TunnelDown as exc:
+        print(f"tunnel:   DOWN ({exc})")
+        print(f"          Expected an SSH session from the laptop carrying:")
+        print(f"              RemoteForward {PORT} 127.0.0.1:{PORT}")
+        print()
+        if os.environ.get("PASSH_NO_FALLBACK"):
+            print("fallback: disabled by PASSH_NO_FALLBACK")
+            return 1
+        print("fallback: local op on this machine")
+        rc, out, err = run_local(["account", "list"], None, fallback=True)
+        sys.stdout.flush()
+        sys.stdout.buffer.write(out)
+        if rc != 0:
+            sys.stderr.buffer.write(err)
+            print("          Not signed in. Run: eval $(op signin)")
+        elif not any(k.startswith("OP_SESSION_") for k in os.environ):
+            print("          Accounts are configured; each call will ask for your")
+            print("          password until you run: eval $(op signin)")
+        return rc
+
+    print("tunnel:   up")
     if rc != 0:
         sys.stderr.buffer.write(err)
         return rc
-    print(f"op:       {out.decode().strip()} (on the Mac)")
+    print(f"op:       {out.decode().strip()} (on the laptop)")
     print("accounts:")
     rc, out, err = op_exec(["account", "list"])
     sys.stdout.flush()
     sys.stdout.buffer.write(out)
     if rc != 0:
         sys.stderr.buffer.write(err)
-        print("          Reachable, but not authorised — unlock 1Password on the Mac.")
+        print("          Reachable, but not authorised — unlock 1Password on the laptop.")
     return rc
 
 
@@ -288,8 +369,10 @@ def main() -> int:
         return cmd_inject(rest)
     if cmd == "doctor":
         return cmd_doctor()
-    stdin = None if sys.stdin.isatty() else sys.stdin.buffer.read()
-    return passthrough(argv, stdin or None)
+    # Deliberately no stdin here: reading it would block forever when passh is
+    # called from a script or an agent, where stdin is an open pipe nobody
+    # closes. `inject` and `run` read their own input explicitly.
+    return passthrough(argv, None)
 
 
 if __name__ == "__main__":

@@ -123,18 +123,46 @@ boundary.
 access on the remote machine mint a durable credential or repoint the CLI at
 another account — exactly the property this design exists to avoid.
 
-`passhd` enforces this list itself. The client enforces it too, but that check
-is only a convenience: the client runs on the machine being protected against,
-so nothing it claims can be trusted.
+`passhd` enforces this list itself. The client enforces it too on the tunnel
+path, but that check is only a convenience: the client runs on the machine
+being protected against, so nothing it claims can be trusted.
 
 **Audit.** `passhd` logs every invocation's arguments to
 `~/.local/state/passh/passhd.log`. It never logs stdin or stdout — those carry
 the `op://` templates and the resolved secrets.
 
+## When there is no tunnel
+
+Sometimes the forward is not there: you are on a phone SSH client, the laptop
+is asleep, you forgot the `RemoteForward`, or — easy to miss — a `tmux` session
+on the remote machine has outlived the SSH session that carried the tunnel.
+
+passh does not try to identify the client. It attempts the tunnel, and if the
+connection fails it falls back to running `op` on the remote machine itself,
+saying so on stderr. That path authenticates with your 1Password *password*
+rather than Touch ID, so it asks for one:
+
+```bash
+eval $(op signin)     # 30-minute session, then passh stops asking
+```
+
+On a headless box passh sets `OP_BIOMETRIC_UNLOCK_ENABLED=false` for the
+fallback, otherwise `op` would try to reach a desktop app that cannot prompt
+anyone and fail with `cannot connect to 1Password app`.
+
+`PASSH_NO_FALLBACK=1` turns this off and makes a missing tunnel a hard error.
+`PASSH_MODE=local|remote` forces one path.
+
+Note that the blocklist below applies to the tunnel, not to the fallback: once
+`op` is running locally there is nothing to protect, since anyone who could run
+`passh` could run `op` directly.
+
 ## Limits
 
-- Requires an open SSH session from the laptop. Cron and background jobs on the
-  remote machine cannot use it. This is deliberate.
+- The tunnel requires an open SSH session from the laptop. Without one you get
+  the password fallback above, which needs a terminal to type into — so cron
+  and unattended jobs still cannot use passh unless an `OP_SESSION_*` is
+  already exported.
 - `op run` cannot be forwarded as-is — it would launch your command on the
   laptop. `passh run` resolves the env-file remotely and execs the command
   locally instead. Same contract, split across the hop.
