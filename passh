@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""passh — the 1Password CLI, run where the biometrics are.
+
+On the Mac this just calls the local `op`.
+
+On serveserve there is no usable biometric prompt: the 1Password app there
+throws its auth dialog onto a GUI session nobody is watching. So passh sends
+the call back to the Mac through a tunnel carried by the SSH session you
+already have open, and Touch ID appears in front of you.
+
+That tunnel only exists while you are connected, so the server's access to
+your vaults ends when your session does. Nothing durable is stored here.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import platform
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+PORT = int(os.environ.get("PASSH_PORT", "18340"))
+ENDPOINT = f"http://127.0.0.1:{PORT}/op"
+TOKEN_PATH = Path(os.environ.get("PASSH_TOKEN_FILE", Path.home() / ".config" / "passh" / "token"))
+LOCAL_OP = os.environ.get("PASSH_OP", "op")
+
+BLOCKED = {"service-account", "signin", "signout", "update", "completion"}
+BLOCKED_PAIRS = {("account", "add"), ("account", "forget")}
+
+USAGE = """passh — the 1Password CLI, run where the biometrics are.
+
+  passh run --env-file=FILE -- CMD...   resolve op:// refs, run CMD here
+  passh inject [-i FILE] [-o FILE]      resolve op:// refs in a template
+  passh read op://VAULT/ITEM/FIELD      print one secret
+  passh doctor                          check the link to the Mac
+  passh <any other op subcommand>       forwarded verbatim
+
+Prefer `passh run` over `passh read`: it keeps secret values out of your
+terminal, your shell history, and any agent's conversation context.
+
+Env: PASSH_PORT, PASSH_OP, PASSH_TOKEN_FILE, PASSH_FORCE_REMOTE
+"""
+
+
+def die(msg: str, code: int = 1) -> "NoReturn":  # noqa: F821
+    print(f"passh: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def is_remote() -> bool:
+    if os.environ.get("PASSH_FORCE_REMOTE"):
+        return True
+    return platform.system() != "Darwin"
+
+
+def check_blocked(args: list[str]) -> None:
+    """Fail fast on the client. passhd enforces this too, and authoritatively."""
+    positional = [a for a in args if not a.startswith("-")]
+    if not positional:
+        return
+    name = None
+    if positional[0] in BLOCKED:
+        name = positional[0]
+    elif len(positional) >= 2 and (positional[0], positional[1]) in BLOCKED_PAIRS:
+        name = f"{positional[0]} {positional[1]}"
+    if name:
+        die(f"'{name}' is blocked. Run it on the Mac directly if you really mean it.")
+
+
+def op_exec(args: list[str], stdin: bytes | None = None) -> tuple[int, bytes, bytes]:
+    """Run op locally or through the tunnel. Returns (rc, stdout, stderr)."""
+    check_blocked(args)
+
+    if not is_remote():
+        try:
+            proc = subprocess.run([LOCAL_OP, *args], input=stdin, capture_output=True)
+        except FileNotFoundError:
+            die(f"{LOCAL_OP} not found on PATH")
+        return proc.returncode, proc.stdout, proc.stderr
+
+    try:
+        token = TOKEN_PATH.read_text().strip()
+    except OSError:
+        die(
+            f"no token at {TOKEN_PATH}.\n"
+            "       Copy it from the Mac: scp ~/.config/passh/token serveserve.local:.config/passh/token"
+        )
+
+    payload = json.dumps({
+        "args": args,
+        "stdin": base64.b64encode(stdin).decode() if stdin else None,
+    }).encode()
+    req = urllib.request.Request(
+        ENDPOINT,
+        data=payload,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            body = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        try:
+            detail = json.loads(detail).get("error", detail)
+        except ValueError:
+            pass
+        if exc.code == 401:
+            die(f"the Mac rejected our token: {detail}\n"
+                "       Re-copy ~/.config/passh/token from the Mac.")
+        die(f"passhd returned {exc.code}: {detail}")
+    except urllib.error.URLError as exc:
+        die(
+            f"cannot reach passhd on 127.0.0.1:{PORT} ({exc.reason}).\n"
+            "       The tunnel rides your SSH session from the Mac. Is that session\n"
+            "       still open, and does its ssh config carry:\n"
+            f"           RemoteForward {PORT} 127.0.0.1:{PORT}"
+        )
+    return (
+        int(body["rc"]),
+        base64.b64decode(body["stdout"]),
+        base64.b64decode(body["stderr"]),
+    )
+
+
+def passthrough(args: list[str], stdin: bytes | None = None) -> int:
+    rc, out, err = op_exec(args, stdin)
+    sys.stdout.flush()
+    sys.stdout.buffer.write(out)
+    sys.stdout.buffer.flush()
+    sys.stderr.buffer.write(err)
+    sys.stderr.buffer.flush()
+    return rc
+
+
+def cmd_run(argv: list[str]) -> int:
+    """`op run` cannot be forwarded as-is — it would launch CMD on the Mac.
+
+    So resolve the env-file over there, then exec CMD here with the values in
+    the environment. Same contract as `op run`, split across the hop.
+    """
+    env_file = None
+    pass_through: list[str] = []
+    while argv:
+        arg = argv[0]
+        if arg.startswith("--env-file="):
+            env_file = arg.split("=", 1)[1]
+            argv.pop(0)
+        elif arg == "--env-file":
+            if len(argv) < 2:
+                die("--env-file needs a value")
+            env_file = argv[1]
+            del argv[:2]
+        elif arg.startswith("--account="):
+            pass_through.append(argv.pop(0))
+        elif arg == "--account":
+            if len(argv) < 2:
+                die("--account needs a value")
+            pass_through += argv[:2]
+            del argv[:2]
+        elif arg == "--no-masking":
+            argv.pop(0)          # nothing is echoed back here anyway
+        elif arg == "--":
+            argv.pop(0)
+            break
+        elif arg.startswith("-"):
+            die(f"unrecognised flag for 'passh run': {arg}")
+        else:
+            break
+
+    if not env_file:
+        die("'run' needs --env-file=FILE")
+    if not argv:
+        die("'run' needs a command after '--'")
+    try:
+        template = Path(env_file).read_bytes()
+    except OSError as exc:
+        die(f"cannot read env file: {exc}")
+
+    rc, out, err = op_exec(["inject", *pass_through], stdin=template)
+    if rc != 0:
+        sys.stderr.buffer.write(err)
+        return rc
+
+    env = dict(os.environ)
+    for line in out.decode().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        env[key.strip()] = value
+
+    # execve passes the environment out of band, so resolved values never
+    # appear in any process's argv.
+    try:
+        os.execvpe(argv[0], argv, env)
+    except OSError as exc:
+        die(f"cannot run {argv[0]}: {exc}", 127)
+
+
+def cmd_inject(argv: list[str]) -> int:
+    in_file = out_file = None
+    pass_through: list[str] = []
+    while argv:
+        arg = argv[0]
+        if arg in ("-i", "--in-file"):
+            if len(argv) < 2:
+                die(f"{arg} needs a value")
+            in_file = argv[1]
+            del argv[:2]
+        elif arg.startswith("--in-file="):
+            in_file = argv.pop(0).split("=", 1)[1]
+        elif arg in ("-o", "--out-file"):
+            if len(argv) < 2:
+                die(f"{arg} needs a value")
+            out_file = argv[1]
+            del argv[:2]
+        elif arg.startswith("--out-file="):
+            out_file = argv.pop(0).split("=", 1)[1]
+        elif arg in ("-f", "--force"):
+            argv.pop(0)
+        else:
+            pass_through.append(argv.pop(0))
+
+    if in_file:
+        try:
+            content = Path(in_file).read_bytes()
+        except OSError as exc:
+            die(f"cannot read input file: {exc}")
+    else:
+        content = sys.stdin.buffer.read()
+    if not content:
+        die("'inject' got empty input")
+
+    rc, out, err = op_exec(["inject", *pass_through], stdin=content)
+    sys.stderr.buffer.write(err)
+    if rc != 0:
+        return rc
+
+    # -o is handled here: the output belongs on this machine, not the Mac.
+    if out_file:
+        path = Path(out_file)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(out)
+    else:
+        sys.stdout.buffer.write(out)
+    return 0
+
+
+def cmd_doctor() -> int:
+    if not is_remote():
+        print("mode:     local (macOS — using the op on this machine)")
+        print(f"op:       {LOCAL_OP}")
+        return passthrough(["account", "list"])
+
+    print(f"mode:     remote -> passhd on 127.0.0.1:{PORT} (tunnelled to the Mac)")
+    print(f"token:    {TOKEN_PATH} {'found' if TOKEN_PATH.exists() else 'MISSING'}")
+    rc, out, err = op_exec(["--version"])
+    if rc != 0:
+        sys.stderr.buffer.write(err)
+        return rc
+    print(f"op:       {out.decode().strip()} (on the Mac)")
+    print("accounts:")
+    rc, out, err = op_exec(["account", "list"])
+    sys.stdout.flush()
+    sys.stdout.buffer.write(out)
+    if rc != 0:
+        sys.stderr.buffer.write(err)
+        print("          Reachable, but not authorised — unlock 1Password on the Mac.")
+    return rc
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE, end="")
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "run":
+        return cmd_run(rest)
+    if cmd == "inject":
+        return cmd_inject(rest)
+    if cmd == "doctor":
+        return cmd_doctor()
+    stdin = None if sys.stdin.isatty() else sys.stdin.buffer.read()
+    return passthrough(argv, stdin or None)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
