@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """passhd — the Mac-side half of passh.
 
-Listens on loopback only. serveserve reaches it through a RemoteForward
+Listens on loopback only. The remote machine reaches it through a RemoteForward
 carried by the SSH session *you* opened, so this is reachable exactly as long
 as you are connected, and never from the network.
 
@@ -49,7 +49,7 @@ def load_token() -> str:
     token = secrets.token_urlsafe(32)
     TOKEN_PATH.write_text(token + "\n")
     TOKEN_PATH.chmod(0o600)
-    logging.warning("generated a new token at %s — copy it to serveserve", TOKEN_PATH)
+    logging.warning("generated a new token at %s — copy it to the remote host", TOKEN_PATH)
     return token
 
 

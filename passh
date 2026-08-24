@@ -3,13 +3,13 @@
 
 On the Mac this just calls the local `op`.
 
-On serveserve there is no usable biometric prompt: the 1Password app there
-throws its auth dialog onto a GUI session nobody is watching. So passh sends
-the call back to the Mac through a tunnel carried by the SSH session you
-already have open, and Touch ID appears in front of you.
+On a remote machine there is no usable biometric prompt: if the 1Password app
+is installed there it throws its auth dialog onto a GUI session nobody is
+watching. So passh sends the call back to your laptop through a tunnel carried
+by the SSH session you already have open, and Touch ID appears in front of you.
 
-That tunnel only exists while you are connected, so the server's access to
-your vaults ends when your session does. Nothing durable is stored here.
+That tunnel only exists while you are connected, so the remote machine's access
+to your vaults ends when your session does. Nothing durable is stored here.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ def op_exec(args: list[str], stdin: bytes | None = None) -> tuple[int, bytes, by
     except OSError:
         die(
             f"no token at {TOKEN_PATH}.\n"
-            "       Copy it from the Mac: scp ~/.config/passh/token serveserve.local:.config/passh/token"
+            "       Copy it from your laptop: scp ~/.config/passh/token THIS_HOST:.config/passh/token"
         )
 
     payload = json.dumps({
