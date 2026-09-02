@@ -6,6 +6,9 @@ carried by the SSH session *you* opened, so this is reachable exactly as long
 as you are connected, and never from the network.
 
 It runs `op` here, where Touch ID works, and hands back the result.
+
+/op forwards an invocation verbatim. /fields is narrower on purpose: it fetches
+an item, strips every value out of it here, and returns only the shape.
 """
 
 from __future__ import annotations
@@ -37,6 +40,42 @@ LOG_PATH = Path.home() / ".local" / "state" / "passh" / "passhd.log"
 # durable credential or repoint the CLI at another account.
 BLOCKED = {"service-account", "signin", "signout", "update", "completion"}
 BLOCKED_PAIRS = {("account", "add"), ("account", "forget")}
+
+# The only field keys /fields will hand back. An allow-list, so a value-bearing
+# key added by a future op release is dropped rather than forwarded.
+FIELD_KEYS = ("id", "label", "type", "purpose")
+
+
+def parse_ref(ref: str) -> tuple[str, str]:
+    """Split op://VAULT/ITEM, or raise ValueError.
+
+    Strict, because these become argv for op: a segment starting with '-' would
+    be read as a flag. A third segment means the caller wanted a field's value,
+    which is the one thing this endpoint will not fetch.
+    """
+    if not ref.startswith("op://"):
+        raise ValueError("expected an op://VAULT/ITEM reference")
+    parts = ref[len("op://"):].split("/")
+    if len(parts) != 2 or not all(parts):
+        raise ValueError("expected op://VAULT/ITEM, with no field component")
+    for part in parts:
+        if part.startswith("-") or any(ch < " " for ch in part):
+            raise ValueError(f"invalid path segment {part!r}")
+    return parts[0], parts[1]
+
+
+def sanitize_fields(item: dict) -> list[dict]:
+    """Reduce an item to its shape: labels, types, sections. Never values."""
+    section_labels = {s.get("id"): s.get("label") for s in item.get("sections") or []}
+    fields = []
+    for field in item.get("fields") or []:
+        meta = {key: field[key] for key in FIELD_KEYS if field.get(key)}
+        section = field.get("section") or {}
+        name = section.get("label") or section_labels.get(section.get("id")) or section.get("id")
+        if name:
+            meta["section"] = name
+        fields.append(meta)
+    return fields
 
 
 def load_token() -> str:
@@ -86,26 +125,98 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return hmac.compare_digest(header[len(prefix):], self.server.token)
 
+    def _read_json(self) -> dict | None:
+        """Parse the request body, or reply with the reason and return None."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._reply(400, {"error": "bad Content-Length"})
+            return None
+        if length <= 0 or length > MAX_BODY:
+            self._reply(400, {"error": "bad body size"})
+            return None
+        try:
+            req = json.loads(self.rfile.read(length))
+        except ValueError as exc:
+            self._reply(400, {"error": f"bad request: {exc}"})
+            return None
+        if not isinstance(req, dict):
+            self._reply(400, {"error": "bad request: expected an object"})
+            return None
+        return req
+
+    def _run_op(self, args: list[str], stdin: bytes | None = None):
+        """Run op, or reply with the failure and return None."""
+        try:
+            return subprocess.run(          # noqa: S603 — no shell, list args
+                [OP, *args],
+                input=stdin,
+                capture_output=True,
+                timeout=OP_TIMEOUT,
+            )
+        except FileNotFoundError:
+            self._reply(500, {"error": f"op not found at {OP}"})
+        except subprocess.TimeoutExpired:
+            self._reply(504, {"error": "op timed out — was the prompt ignored?"})
+        return None
+
     def do_POST(self) -> None:  # noqa: N802
-        if self.path != "/op":
+        routes = {"/op": self.handle_op, "/fields": self.handle_fields}
+        route = routes.get(self.path)
+        if route is None:
             self._reply(404, {"error": "not found"})
             return
         if not self._authorised():
             logging.warning("rejected an unauthorised request")
             self._reply(401, {"error": "bad or missing token"})
             return
+        req = self._read_json()
+        if req is not None:
+            route(req)
 
+    def handle_fields(self, req: dict) -> None:
+        """Return an item's shape, never its contents.
+
+        The filtering happens here, on the machine that holds the values,
+        because that is the only place it means anything. Sending the item
+        through the tunnel and stripping it on the far side would put every
+        secret on the wire first.
+        """
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            self._reply(400, {"error": "bad Content-Length"})
-            return
-        if length <= 0 or length > MAX_BODY:
-            self._reply(400, {"error": "bad body size"})
+            vault, item = parse_ref(str(req["ref"]))
+        except (KeyError, ValueError) as exc:
+            self._reply(400, {"error": f"bad reference: {exc}"})
             return
 
+        args = ["item", "get", item, "--vault", vault, "--format", "json"]
+        account = req.get("account")
+        if account:
+            account = str(account)
+            if account.startswith("-"):
+                self._reply(400, {"error": "bad account name"})
+                return
+            args += ["--account", account]
+
+        logging.info("op %s", " ".join(args))
+        proc = self._run_op(args)
+        if proc is None:
+            return
+        if proc.returncode != 0:
+            # op's failures name vaults and items, never field values.
+            self._reply(200, {
+                "rc": proc.returncode,
+                "stderr": base64.b64encode(proc.stderr).decode(),
+            })
+            return
         try:
-            req = json.loads(self.rfile.read(length))
+            fields = sanitize_fields(json.loads(proc.stdout))
+        except ValueError as exc:
+            self._reply(502, {"error": f"could not parse op's output: {exc}"})
+            return
+        self._reply(200, {"rc": 0, "fields": fields})
+
+    def handle_op(self, req: dict) -> None:
+        try:
             args = [str(a) for a in req["args"]]
             raw = req.get("stdin")
             stdin = base64.b64decode(raw, validate=True) if raw else None
@@ -122,18 +233,8 @@ class Handler(BaseHTTPRequestHandler):
         # Never log stdin or stdout: one holds op:// templates, the other holds
         # the resolved secrets. Args alone are the useful audit trail.
         logging.info("op %s", " ".join(args))
-        try:
-            proc = subprocess.run(          # noqa: S603 — no shell, list args
-                [OP, *args],
-                input=stdin,
-                capture_output=True,
-                timeout=OP_TIMEOUT,
-            )
-        except FileNotFoundError:
-            self._reply(500, {"error": f"op not found at {OP}"})
-            return
-        except subprocess.TimeoutExpired:
-            self._reply(504, {"error": "op timed out — was the prompt ignored?"})
+        proc = self._run_op(args, stdin)
+        if proc is None:
             return
 
         self._reply(200, {

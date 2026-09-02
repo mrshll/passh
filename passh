@@ -26,17 +26,51 @@ from pathlib import Path
 
 PORT = int(os.environ.get("PASSH_PORT", "18340"))
 ENDPOINT = f"http://127.0.0.1:{PORT}/op"
+FIELDS_ENDPOINT = f"http://127.0.0.1:{PORT}/fields"
 TOKEN_PATH = Path(os.environ.get("PASSH_TOKEN_FILE", Path.home() / ".config" / "passh" / "token"))
 LOCAL_OP = os.environ.get("PASSH_OP", "op")
 
 BLOCKED = {"service-account", "signin", "signout", "update", "completion"}
 BLOCKED_PAIRS = {("account", "add"), ("account", "forget")}
 
+# Kept in step with passhd's copies by hand: these are two standalone scripts,
+# and the daemon must not depend on the client's version of either anyway.
+FIELD_KEYS = ("id", "label", "type", "purpose")
+
+
+def parse_ref(ref: str) -> tuple[str, str]:
+    """Split op://VAULT/ITEM, or raise ValueError."""
+    if not ref.startswith("op://"):
+        raise ValueError("expected an op://VAULT/ITEM reference")
+    parts = ref[len("op://"):].split("/")
+    if len(parts) != 2 or not all(parts):
+        raise ValueError("expected op://VAULT/ITEM, with no field component")
+    for part in parts:
+        if part.startswith("-") or any(ch < " " for ch in part):
+            raise ValueError(f"invalid path segment {part!r}")
+    return parts[0], parts[1]
+
+
+def sanitize_fields(item: dict) -> list[dict]:
+    """Reduce an item to its shape: labels, types, sections. Never values."""
+    section_labels = {s.get("id"): s.get("label") for s in item.get("sections") or []}
+    fields = []
+    for field in item.get("fields") or []:
+        meta = {key: field[key] for key in FIELD_KEYS if field.get(key)}
+        section = field.get("section") or {}
+        name = section.get("label") or section_labels.get(section.get("id")) or section.get("id")
+        if name:
+            meta["section"] = name
+        fields.append(meta)
+    return fields
+
+
 USAGE = """passh — the 1Password CLI, run where the biometrics are.
 
   passh run --env-file=FILE -- CMD...   resolve op:// refs, run CMD here
   passh inject [-i FILE] [-o FILE]      resolve op:// refs in a template
   passh read op://VAULT/ITEM/FIELD      print one secret
+  passh fields op://VAULT/ITEM          list field metadata; values never leave the Mac
   passh doctor                          check the link to the Mac
   passh <any other op subcommand>       forwarded verbatim
 
@@ -143,7 +177,8 @@ def op_exec(args: list[str], stdin: bytes | None = None) -> tuple[int, bytes, by
         return run_local(args, stdin, fallback=True)
 
 
-def run_remote(args: list[str], stdin: bytes | None) -> tuple[int, bytes, bytes]:
+def post(endpoint: str, payload: dict) -> dict:
+    """POST to passhd through the tunnel. Raises TunnelDown if it is not there."""
     try:
         token = TOKEN_PATH.read_text().strip()
     except OSError:
@@ -152,19 +187,15 @@ def run_remote(args: list[str], stdin: bytes | None) -> tuple[int, bytes, bytes]
             "       Copy it from your laptop: scp ~/.config/passh/token THIS_HOST:.config/passh/token"
         )
 
-    payload = json.dumps({
-        "args": args,
-        "stdin": base64.b64encode(stdin).decode() if stdin else None,
-    }).encode()
     req = urllib.request.Request(
-        ENDPOINT,
-        data=payload,
+        endpoint,
+        data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
         method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=180) as resp:
-            body = json.load(resp)
+            return json.load(resp)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")
         try:
@@ -177,6 +208,13 @@ def run_remote(args: list[str], stdin: bytes | None) -> tuple[int, bytes, bytes]
         die(f"passhd returned {exc.code}: {detail}")
     except urllib.error.URLError as exc:
         raise TunnelDown(str(exc.reason)) from exc
+
+
+def run_remote(args: list[str], stdin: bytes | None) -> tuple[int, bytes, bytes]:
+    body = post(ENDPOINT, {
+        "args": args,
+        "stdin": base64.b64encode(stdin).decode() if stdin else None,
+    })
     return (
         int(body["rc"]),
         base64.b64decode(body["stdout"]),
@@ -309,6 +347,102 @@ def cmd_inject(argv: list[str]) -> int:
     return 0
 
 
+def fields_local(ref: str, account: str | None, fallback: bool = False) -> tuple[int, list[dict], bytes]:
+    """Fetch the item with the op on this machine and strip it in process."""
+    vault, item = parse_ref(ref)
+    args = ["item", "get", item, "--vault", vault, "--format", "json"]
+    if account:
+        args += ["--account", account]
+    rc, out, err = run_local(args, None, fallback=fallback)
+    if rc != 0:
+        return rc, [], err
+    try:
+        return 0, sanitize_fields(json.loads(out)), b""
+    except ValueError as exc:
+        die(f"could not parse op's output: {exc}")
+
+
+def fields_remote(ref: str, account: str | None) -> tuple[int, list[dict], bytes]:
+    """Ask the Mac for the item's shape. The values stay over there."""
+    body = post(FIELDS_ENDPOINT, {"ref": ref, "account": account})
+    rc = int(body.get("rc", 0))
+    if rc != 0:
+        return rc, [], base64.b64decode(body.get("stderr") or "")
+    return 0, body.get("fields") or [], b""
+
+
+def print_fields(fields: list[dict]) -> None:
+    if not fields:
+        print("(no fields)")
+        return
+    columns = [("label", "LABEL"), ("type", "TYPE"), ("purpose", "PURPOSE"), ("section", "SECTION")]
+    columns = [c for c in columns if any(f.get(c[0]) for f in fields)]
+    rows = [[str(f.get(key, "")) for key, _ in columns] for f in fields]
+    widths = [max(len(head), *(len(row[i]) for row in rows)) for i, (_, head) in enumerate(columns)]
+    for row in [[head for _, head in columns], *rows]:
+        print("  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip())
+
+
+def cmd_fields(argv: list[str]) -> int:
+    """List an item's field labels and types without fetching its values.
+
+    passhd does the stripping on the Mac, so the values are never put on the
+    tunnel at all. Pulling the whole item over here and filtering afterwards
+    would defeat the point.
+    """
+    ref = account = None
+    as_json = False
+    while argv:
+        arg = argv.pop(0)
+        if arg == "--json":
+            as_json = True
+        elif arg == "--account":
+            if not argv:
+                die("--account needs a value")
+            account = argv.pop(0)
+        elif arg.startswith("--account="):
+            account = arg.split("=", 1)[1]
+        elif arg.startswith("-"):
+            die(f"unrecognised flag for 'passh fields': {arg}")
+        elif ref is None:
+            ref = arg
+        else:
+            die("'fields' takes a single op://VAULT/ITEM reference")
+
+    if not ref:
+        die("'fields' needs an op://VAULT/ITEM reference")
+    try:
+        parse_ref(ref)
+    except ValueError as exc:
+        die(f"bad reference: {exc}")
+
+    if not is_remote():
+        rc, fields, err = fields_local(ref, account)
+    else:
+        try:
+            rc, fields, err = fields_remote(ref, account)
+        except TunnelDown as exc:
+            if os.environ.get("PASSH_NO_FALLBACK"):
+                die(f"no tunnel to the laptop ({exc}) and PASSH_NO_FALLBACK is set")
+            warn_fallback(str(exc))
+            # Worth spelling out: the filtering happens wherever op runs, so
+            # without the tunnel the values are fetched onto this machine. They
+            # are dropped and never printed, but the Mac boundary is gone.
+            print("       'fields' normally filters on the Mac. With no tunnel the", file=sys.stderr)
+            print("       values are fetched here instead — discarded, never printed,", file=sys.stderr)
+            print("       but they do reach this machine.", file=sys.stderr)
+            rc, fields, err = fields_local(ref, account, fallback=True)
+
+    if rc != 0:
+        sys.stderr.buffer.write(err)
+        return rc
+    if as_json:
+        print(json.dumps({"fields": fields}))
+    else:
+        print_fields(fields)
+    return 0
+
+
 def cmd_doctor() -> int:
     mode = resolve_mode()
     if mode == "local":
@@ -367,6 +501,8 @@ def main() -> int:
         return cmd_run(rest)
     if cmd == "inject":
         return cmd_inject(rest)
+    if cmd == "fields":
+        return cmd_fields(rest)
     if cmd == "doctor":
         return cmd_doctor()
     # Deliberately no stdin here: reading it would block forever when passh is

@@ -90,6 +90,19 @@ process's argv:
 passh run --env-file=<(echo 'MY_TOKEN=op://Vault/item/field') -- some-command
 ```
 
+To find out what an item holds without pulling any of it across, use
+`passh fields`:
+
+```bash
+passh fields op://Vault/item          # LABEL / TYPE / PURPOSE / SECTION
+passh fields op://Vault/item --json   # {"fields":[{"label":"bot-token",...}]}
+```
+
+`passhd` runs `op item get --format json` on the laptop, strips every value out
+of the result there, and sends back labels, ids, types, purposes and section
+names only. The secrets never touch the tunnel, so this is safe to run in a
+terminal an agent can read — unlike `passh read`.
+
 Everything else is forwarded to `op` verbatim:
 
 ```bash
@@ -126,6 +139,16 @@ another account — exactly the property this design exists to avoid.
 `passhd` enforces this list itself. The client enforces it too on the tunnel
 path, but that check is only a convenience: the client runs on the machine
 being protected against, so nothing it claims can be trusted.
+
+**Field listings.** `passh fields` is a separate endpoint rather than a
+forwarded `op` call, because the filtering has to happen on the machine that
+holds the values. Fetching the whole item over the tunnel and stripping it on
+the remote side would put every secret on the wire first, which is the thing
+being avoided.
+
+With no tunnel the fallback still filters, but `op` is running on the remote
+machine by then, so the values do reach it — passh says so on stderr when that
+happens.
 
 **Audit.** `passhd` logs every invocation's arguments to
 `~/.local/state/passh/passhd.log`. It never logs stdin or stdout — those carry
