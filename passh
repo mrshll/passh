@@ -189,6 +189,30 @@ def split_refs(lineno: int, key: str, value: str) -> list[tuple[bool, str]]:
     return [(is_ref, text) for is_ref, text in parts if is_ref or text]
 
 
+# op's output on failure is never shown by `run`: it is not ours to vouch for
+# and could quote something it resolved. These substrings only pick one of the
+# fixed hints below; none of op's text is ever printed.
+INJECT_FAILURE_HINTS = (
+    (b"not currently signed in",
+     ("op is not signed in on the machine running it. Check with `passh doctor`;\n"
+      "       in no-tunnel fallback, run: eval $(op signin)")),
+    (b"authorization timeout",
+     "1Password was not unlocked in time. Approve the prompt on the laptop and retry."),
+)
+INJECT_FAILURE_DEFAULT = (
+    "Check the link and sign-in with `passh doctor`, and each item with\n"
+    "       `passh fields op://VAULT/ITEM`."
+)
+
+
+def report_inject_failure(rc: int, err: bytes, command: str) -> None:
+    print(f"passh: op inject failed (exit {rc}); not running {command}.", file=sys.stderr)
+    print("       op's own output is not shown: it can contain secret values.", file=sys.stderr)
+    lowered = err.lower()
+    hint = next((h for needle, h in INJECT_FAILURE_HINTS if needle in lowered), INJECT_FAILURE_DEFAULT)
+    print(f"       {hint}", file=sys.stderr)
+
+
 def frame_refs(refs: list[str], nonce: str) -> bytes:
     """One op inject template for every reference, each between marker lines."""
     chunks = [f"{nonce}:{i}\n{{{{ {ref} }}}}\n" for i, ref in enumerate(refs)]
@@ -446,7 +470,7 @@ def cmd_run(argv: list[str]) -> int:
         nonce = secrets.token_hex(16)
         rc, out, err = op_exec(["inject", *pass_through], stdin=frame_refs(refs, nonce))
         if rc != 0:
-            sys.stderr.buffer.write(err)
+            report_inject_failure(rc, err, argv[0])
             return rc
         values = unframe(out, len(refs), nonce)
         if values is None:

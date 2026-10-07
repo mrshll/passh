@@ -127,9 +127,15 @@ RAW='no \n escapes, $HOME stays literal'    # single quotes: literal
 
 Anything malformed stops passh before `op` is called and before the command
 runs. passh's own errors name the line and key, never a value. `op` is only
-ever sent references, never literal text. If `op` itself fails, its stdout is
-never shown and its stderr is forwarded unchanged — that is how you learn you
-need to sign in. passh does not sanitize `op`'s diagnostics.
+ever sent references, never literal text.
+
+If `op inject` fails, `passh run` shows none of op's output — stdout or stderr,
+since an error message could quote something it resolved — and exits with op's
+exit code. It prints a fixed message instead: a specific hint when op reported
+that it is not signed in or that the unlock prompt timed out, and otherwise a
+pointer to `passh doctor` and `passh fields`. To see op's own error, run
+`passh doctor`, or reproduce the failure with `passh inject` in a terminal you
+trust.
 
 To find out what an item holds without pulling any of it across, use
 `passh fields`:
