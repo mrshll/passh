@@ -68,7 +68,11 @@ def sanitize_fields(item: dict) -> list[dict]:
 
 
 ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-ENCLOSED_REF = re.compile(r"\{\{\s*(op://[^{}\n]*?)\s*\}\}")
+# A reference: no braces except op's own ${VAR}, no control characters, no
+# undecodable bytes. Spaces are allowed; item and field names have them.
+_REF_CHAR = r"[^{}\x00-\x1f\x7f\udc80-\udcff]"
+REF = re.compile(rf"op://(?:{_REF_CHAR}|\$\{{{_REF_CHAR}*\}})+")
+ENCLOSED_REF = re.compile(rf"\{{\{{[ \t]*({REF.pattern}?)[ \t]*\}}\}}")
 BARE_REF = re.compile(r"(?<![A-Za-z0-9+.-])op://")
 DQ_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}
 
@@ -106,7 +110,7 @@ def parse_env_file(text: str) -> list[tuple[int, str, str]]:
             raise EnvFileError(f"line {lineno}: expected KEY=VALUE")
         if not ENV_KEY.fullmatch(key):
             raise EnvFileError(f"line {lineno}: invalid variable name")
-        start = pos + raw.index("=") + 1
+        after_eq = start = pos + raw.index("=") + 1
         while start < eol and text[start] in " \t":
             start += 1
 
@@ -122,7 +126,7 @@ def parse_env_file(text: str) -> list[tuple[int, str, str]]:
             if tail and not tail.startswith("#"):
                 raise EnvFileError(f"line {lineno} ({key}): unexpected text after the closing quote")
         else:
-            value = text[start:eol]
+            value = text[after_eq:eol]
             comment = re.search(r"[ \t]#", value)
             if comment:
                 value = value[:comment.start()]
@@ -163,8 +167,8 @@ def split_refs(lineno: int, key: str, value: str) -> list[tuple[bool, str]]:
     $VARS in it.
     """
     if value.startswith("op://") and "{{" not in value:
-        if "\n" in value:
-            raise EnvFileError(f"line {lineno} ({key}): a reference cannot span lines")
+        if not REF.fullmatch(value):
+            raise EnvFileError(f"line {lineno} ({key}): not a valid op:// reference")
         return [(True, value)]
     parts = []
     last = 0
@@ -176,7 +180,8 @@ def split_refs(lineno: int, key: str, value: str) -> list[tuple[bool, str]]:
     for is_ref, text in parts:
         if not is_ref and BARE_REF.search(text):
             raise EnvFileError(
-                f"line {lineno} ({key}): an op:// reference inside other text must be written {{{{ op://... }}}}"
+                f"line {lineno} ({key}): an op:// reference inside other text must be"
+                " written {{ op://... }}"
             )
     return [(is_ref, text) for is_ref, text in parts if is_ref or text]
 

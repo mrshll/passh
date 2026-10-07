@@ -1,10 +1,11 @@
 """A stand-in for `op inject`, so tests never touch a real vault.
 
-Secrets come from the JSON file named by FAKE_OP_SECRETS and every invocation's
-argv is appended to FAKE_OP_LOG; the template it was given goes to
-FAKE_OP_STDIN when set. Both bare `op://...` references and `{{ op://... }}`
-are substituted, as `op inject` does. FAKE_OP_TAMPER corrupts the output in
-the ways passh must refuse to guess about.
+Secrets come from fixtures.SECRETS. Every invocation's argv is appended to
+FAKE_OP_LOG; the template it was given (references only, no values) goes to
+FAKE_OP_STDIN when set. Bare `op://...` references and `{{ op://... }}` are
+substituted in one pass over the template, so a resolved value is never
+scanned again. FAKE_OP_TAMPER corrupts the output in the ways passh must refuse
+to guess about.
 """
 
 from __future__ import annotations
@@ -14,8 +15,9 @@ import os
 import re
 import sys
 
-ENCLOSED = re.compile(rb"\{\{\s*(op://[^}]*?)\s*\}\}")
-BARE = re.compile(rb"op://[^\s\"'{}]+")
+from fixtures import SECRETS
+
+REFERENCE = re.compile(rb"\{\{\s*(op://[^}]*?)\s*\}\}|(op://[^\s\"'{}]+)")
 
 
 class Unresolved(Exception):
@@ -29,8 +31,7 @@ def inject(template: bytes, secrets: dict[str, str]) -> bytes:
         except KeyError:
             raise Unresolved(ref.decode()) from None
 
-    out = ENCLOSED.sub(lambda m: resolve(m.group(1)), template)
-    return BARE.sub(lambda m: resolve(m.group(0)), out)
+    return REFERENCE.sub(lambda m: resolve(m.group(1) or m.group(2)), template)
 
 
 def tamper(mode: str, template: bytes, out: bytes) -> bytes:
@@ -57,8 +58,7 @@ def main() -> int:
     if not sys.argv[1:] or sys.argv[1] != "inject":
         print("fake op: only 'inject' is supported", file=sys.stderr)
         return 2
-    with open(os.environ["FAKE_OP_SECRETS"]) as fh:
-        secrets = json.load(fh)
+    secrets = SECRETS
     template = sys.stdin.buffer.read()
     if os.environ.get("FAKE_OP_STDIN"):
         with open(os.environ["FAKE_OP_STDIN"], "wb") as fh:
