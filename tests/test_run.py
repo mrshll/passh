@@ -417,6 +417,11 @@ def test_non_utf8_bytes_survive(h: Harness) -> None:
         ("INJ=op://v/i/plain {{ op://v/i/equals }}\n", "INJ"),
         ('CTRL="op://v/i/pl\tain"\n', "CTRL"),
         ('MULTI="op://v/i/plain\nmore"\n', "MULTI"),
+        ("PRE=prefix-op://v/i/plain\n", "PRE"),
+        ("PRE=x.op://v/i/plain\n", "PRE"),
+        ("PRE=a+op://v/i/plain\n", "PRE"),
+        ("PRE=a_op://v/i/plain\n", "PRE"),
+        ("NUL=a\x00b\nTOKEN=op://v/i/plain\n", "NUL"),
     ],
 )
 def test_malformed_values_fail_naming_the_key(

@@ -116,7 +116,8 @@ RAW='no \n escapes, $HOME stays literal'    # single quotes: literal
   written. Only a comment may follow the closing quote.
 - A value that starts with `op://` is a whole reference. Anywhere else, write
   the reference as `{{ op://... }}`; a bare `op://` inside other text is an
-  error rather than a guess. References are resolved inside single quotes too.
+  error rather than a guess (unless it ends a longer word, as in `shop://`).
+  References are resolved inside single quotes too.
 - Literal text is never interpolated: no `$VAR`, no command substitution. It
   never leaves this machine either — only the references go to `op inject`,
   all in one call. Inside a reference, `$VAR` and `${VAR}` follow `op inject`'s
@@ -125,10 +126,10 @@ RAW='no \n escapes, $HOME stays literal'    # single quotes: literal
 - CRLF line endings in the env file are read as LF.
 
 Anything malformed stops passh before `op` is called and before the command
-runs. passh's own errors name the line and key, never a value. If `op` itself
-fails, its error message is shown as-is (it is how you learn you need to sign
-in); `op` is only ever sent references, never literal text or values, and its
-output is never shown.
+runs. passh's own errors name the line and key, never a value. `op` is only
+ever sent references, never literal text. If `op` itself fails, its stdout is
+never shown and its stderr is forwarded unchanged — that is how you learn you
+need to sign in. passh does not sanitize `op`'s diagnostics.
 
 To find out what an item holds without pulling any of it across, use
 `passh fields`:

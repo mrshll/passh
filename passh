@@ -73,7 +73,8 @@ ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _REF_CHAR = r"[^{}\x00-\x1f\x7f\udc80-\udcff]"
 REF = re.compile(rf"op://(?:{_REF_CHAR}|\$\{{{_REF_CHAR}*\}})+")
 ENCLOSED_REF = re.compile(rf"\{{\{{[ \t]*({REF.pattern}?)[ \t]*\}}\}}")
-BARE_REF = re.compile(r"(?<![A-Za-z0-9+.-])op://")
+# op:// at the end of a longer word (shop://) is some other scheme, not a reference.
+BARE_REF = re.compile(r"(?<![A-Za-z0-9])op://")
 DQ_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}
 
 
@@ -178,6 +179,8 @@ def split_refs(lineno: int, key: str, value: str) -> list[tuple[bool, str]]:
         last = match.end()
     parts.append((False, value[last:]))
     for is_ref, text in parts:
+        if not is_ref and "\0" in text:
+            raise EnvFileError(f"line {lineno} ({key}): the value contains a NUL byte")
         if not is_ref and BARE_REF.search(text):
             raise EnvFileError(
                 f"line {lineno} ({key}): an op:// reference inside other text must be"
