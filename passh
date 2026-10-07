@@ -18,6 +18,8 @@ import base64
 import json
 import os
 import platform
+import re
+import secrets
 import subprocess
 import sys
 import urllib.error
@@ -63,6 +65,186 @@ def sanitize_fields(item: dict) -> list[dict]:
             meta["section"] = name
         fields.append(meta)
     return fields
+
+
+ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# A reference: no braces except op's own ${VAR}, no control characters, no
+# undecodable bytes. Spaces are allowed; item and field names have them.
+_REF_CHAR = r"[^{}\x00-\x1f\x7f\udc80-\udcff]"
+REF = re.compile(rf"op://(?:{_REF_CHAR}|\$\{{{_REF_CHAR}*\}})+")
+ENCLOSED_REF = re.compile(rf"\{{\{{[ \t]*({REF.pattern}?)[ \t]*\}}\}}")
+# op:// at the end of a longer word (shop://) is some other scheme, not a reference.
+BARE_REF = re.compile(r"(?<![A-Za-z0-9])op://")
+DQ_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}
+
+
+class EnvFileError(ValueError):
+    """A problem with an env file. Messages name lines and keys, never values."""
+
+
+def parse_env_file(text: str) -> list[tuple[int, str, str]]:
+    """Parse a dotenv template into (line, key, value), before anything is resolved.
+
+    Quoting belongs to the template the user wrote. Resolved secrets are spliced
+    in afterwards and never parsed, so their quotes, newlines and '=' are kept.
+    """
+    text = text.replace("\r\n", "\n")
+    entries = []
+    pos = 0
+    while pos < len(text):
+        lineno = text.count("\n", 0, pos) + 1
+        eol = text.find("\n", pos)
+        if eol == -1:
+            eol = len(text)
+        raw = text[pos:eol]
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            pos = eol + 1
+            continue
+
+        body = stripped
+        if body.startswith(("export ", "export\t")):
+            body = body[len("export"):].lstrip()
+        key, sep, _ = body.partition("=")
+        key = key.strip()
+        if not sep:
+            raise EnvFileError(f"line {lineno}: expected KEY=VALUE")
+        if not ENV_KEY.fullmatch(key):
+            raise EnvFileError(f"line {lineno}: invalid variable name")
+        after_eq = start = pos + raw.index("=") + 1
+        while start < eol and text[start] in " \t":
+            start += 1
+
+        quote = text[start] if start < eol else ""
+        if quote in ('"', "'"):
+            value, close = scan_quoted(text, start + 1, quote)
+            if close is None:
+                raise EnvFileError(f"line {lineno} ({key}): unterminated {quote} quote")
+            eol = text.find("\n", close)
+            if eol == -1:
+                eol = len(text)
+            tail = text[close + 1:eol].strip()
+            if tail and not tail.startswith("#"):
+                raise EnvFileError(f"line {lineno} ({key}): unexpected text after the closing quote")
+        else:
+            value = text[after_eq:eol]
+            comment = re.search(r"[ \t]#", value)
+            if comment:
+                value = value[:comment.start()]
+            value = value.strip()
+        entries.append((lineno, key, value))
+        pos = eol + 1
+    return entries
+
+
+def scan_quoted(text: str, i: int, quote: str) -> tuple[str, int | None]:
+    """Read a quoted value starting after its opening quote, across lines.
+
+    Single quotes are literal. Double quotes understand the escapes in
+    DQ_ESCAPES; any other backslash is kept as written. Returns the value and
+    the index of the closing quote, or None if it never closes.
+    """
+    out = []
+    while i < len(text):
+        ch = text[i]
+        if ch == quote:
+            return "".join(out), i
+        if ch == "\\" and quote == '"' and i + 1 < len(text):
+            nxt = text[i + 1]
+            out.append(DQ_ESCAPES.get(nxt, ch + nxt))
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out), None
+
+
+def split_refs(lineno: int, key: str, value: str) -> list[tuple[bool, str]]:
+    """Split a value into (is_reference, text) parts.
+
+    A value that starts with op:// is one whole reference, spaces and all, as
+    in `op run`. Otherwise only {{ op://... }} is a reference: everything else
+    is literal and stays on this machine, so op never gets a chance to expand
+    $VARS in it.
+    """
+    if value.startswith("op://") and "{{" not in value:
+        if not REF.fullmatch(value):
+            raise EnvFileError(f"line {lineno} ({key}): not a valid op:// reference")
+        return [(True, value)]
+    parts = []
+    last = 0
+    for match in ENCLOSED_REF.finditer(value):
+        parts.append((False, value[last:match.start()]))
+        parts.append((True, match.group(1)))
+        last = match.end()
+    parts.append((False, value[last:]))
+    for is_ref, text in parts:
+        if not is_ref and "\0" in text:
+            raise EnvFileError(f"line {lineno} ({key}): the value contains a NUL byte")
+        if not is_ref and BARE_REF.search(text):
+            raise EnvFileError(
+                f"line {lineno} ({key}): an op:// reference inside other text must be"
+                " written {{ op://... }}"
+            )
+    return [(is_ref, text) for is_ref, text in parts if is_ref or text]
+
+
+# op's output on failure is never shown by `run`: it is not ours to vouch for
+# and could quote something it resolved. These substrings only pick one of the
+# fixed hints below; none of op's text is ever printed.
+INJECT_FAILURE_HINTS = (
+    (b"not currently signed in",
+     ("It looks like op is not signed in on the machine running it. Check with\n"
+      "       `passh doctor`; in no-tunnel fallback, run: eval $(op signin)")),
+    (b"authorization timeout",
+     ("It looks like 1Password was not unlocked in time. Approve the prompt on\n"
+      "       the laptop and retry.")),
+)
+INJECT_FAILURE_DEFAULT = (
+    "Check the link and sign-in with `passh doctor`, and each item with\n"
+    "       `passh fields op://VAULT/ITEM`."
+)
+
+
+def report_inject_failure(rc: int, err: bytes, command: str) -> None:
+    print(f"passh: op inject failed (exit {rc}); not running {command}.", file=sys.stderr)
+    print("       op's own output is not shown: it can contain secret values.", file=sys.stderr)
+    lowered = err.lower()
+    hint = next((h for needle, h in INJECT_FAILURE_HINTS if needle in lowered), INJECT_FAILURE_DEFAULT)
+    print(f"       {hint}", file=sys.stderr)
+
+
+def frame_refs(refs: list[str], nonce: str) -> bytes:
+    """One op inject template for every reference, each between marker lines."""
+    chunks = [f"{nonce}:{i}\n{{{{ {ref} }}}}\n" for i, ref in enumerate(refs)]
+    return "".join([*chunks, f"{nonce}:end\n"]).encode()
+
+
+def unframe(out: bytes, count: int, nonce: str) -> list[bytes] | None:
+    """Undo frame_refs on op's output, or None if it does not match exactly.
+
+    Only the newline frame_refs added after each value is removed; whatever
+    op produced for the value itself is kept byte for byte.
+    """
+    marker = nonce.encode()
+    if out.count(marker) != count + 1:
+        return None
+    values = []
+    pos = 0
+    for i in range(count):
+        head = marker + f":{i}\n".encode()
+        if not out.startswith(head, pos):
+            return None
+        pos += len(head)
+        nxt = b"\n" + marker + (f":{i + 1}\n".encode() if i + 1 < count else b":end")
+        end = out.find(nxt, pos)
+        if end == -1:
+            return None
+        values.append(out[pos:end])
+        pos = end + 1
+    if out[pos:] not in (marker + b":end\n", marker + b":end"):
+        return None
+    return values
 
 
 USAGE = """passh — the 1Password CLI, run where the biometrics are.
@@ -276,25 +458,46 @@ def cmd_run(argv: list[str]) -> int:
     except OSError as exc:
         die(f"cannot read env file: {exc}")
 
-    rc, out, err = op_exec(["inject", *pass_through], stdin=template)
-    if rc != 0:
-        sys.stderr.buffer.write(err)
-        return rc
+    # Parse first, resolve second: never parse text that has secrets in it.
+    try:
+        entries = [(key, split_refs(lineno, key, value))
+                   for lineno, key, value in parse_env_file(os.fsdecode(template))]
+    except EnvFileError as exc:
+        die(f"{env_file}: {exc}")
+
+    refs = list(dict.fromkeys(text for _, parts in entries for is_ref, text in parts if is_ref))
+    resolved: dict[str, str] = {}
+    if refs:
+        nonce = secrets.token_hex(16)
+        try:
+            rc, out, err = op_exec(["inject", *pass_through], stdin=frame_refs(refs, nonce))
+        except (KeyError, TypeError, ValueError):
+            # A reply passh cannot read. The exception would quote it, and it
+            # may hold resolved values, so say only that much.
+            die(f"could not read passhd's reply; not running {argv[0]}")
+        if rc != 0:
+            report_inject_failure(rc, err, argv[0])
+            return rc
+        values = unframe(out, len(refs), nonce)
+        if values is None:
+            die(f"could not map op inject's output back to the keys in {env_file}; not running {argv[0]}")
+        resolved = {ref: os.fsdecode(value) for ref, value in zip(refs, values)}
 
     env = dict(os.environ)
-    for line in out.decode().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        env[key.strip()] = value
+    for key, parts in entries:
+        value = "".join(resolved[text] if is_ref else text for is_ref, text in parts)
+        if "\0" in value:
+            die(f"{key}: the value contains a NUL byte, which cannot be passed in the environment")
+        env[key] = value
 
     # execve passes the environment out of band, so resolved values never
     # appear in any process's argv.
     try:
         os.execvpe(argv[0], argv, env)
     except OSError as exc:
-        die(f"cannot run {argv[0]}: {exc}", 127)
+        # Not str(exc): it names the paths tried, from the resolved PATH.
+        reason = os.strerror(exc.errno) if exc.errno else "launch failed"
+        die(f"cannot run {argv[0]}: {reason}", 127)
 
 
 def cmd_inject(argv: list[str]) -> int:
