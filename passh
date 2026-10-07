@@ -194,10 +194,11 @@ def split_refs(lineno: int, key: str, value: str) -> list[tuple[bool, str]]:
 # fixed hints below; none of op's text is ever printed.
 INJECT_FAILURE_HINTS = (
     (b"not currently signed in",
-     ("op is not signed in on the machine running it. Check with `passh doctor`;\n"
-      "       in no-tunnel fallback, run: eval $(op signin)")),
+     ("It looks like op is not signed in on the machine running it. Check with\n"
+      "       `passh doctor`; in no-tunnel fallback, run: eval $(op signin)")),
     (b"authorization timeout",
-     "1Password was not unlocked in time. Approve the prompt on the laptop and retry."),
+     ("It looks like 1Password was not unlocked in time. Approve the prompt on\n"
+      "       the laptop and retry.")),
 )
 INJECT_FAILURE_DEFAULT = (
     "Check the link and sign-in with `passh doctor`, and each item with\n"
@@ -468,7 +469,12 @@ def cmd_run(argv: list[str]) -> int:
     resolved: dict[str, str] = {}
     if refs:
         nonce = secrets.token_hex(16)
-        rc, out, err = op_exec(["inject", *pass_through], stdin=frame_refs(refs, nonce))
+        try:
+            rc, out, err = op_exec(["inject", *pass_through], stdin=frame_refs(refs, nonce))
+        except (KeyError, TypeError, ValueError):
+            # A reply passh cannot read. The exception would quote it, and it
+            # may hold resolved values, so say only that much.
+            die(f"could not read passhd's reply; not running {argv[0]}")
         if rc != 0:
             report_inject_failure(rc, err, argv[0])
             return rc
@@ -489,7 +495,9 @@ def cmd_run(argv: list[str]) -> int:
     try:
         os.execvpe(argv[0], argv, env)
     except OSError as exc:
-        die(f"cannot run {argv[0]}: {exc}", 127)
+        # Not str(exc): it names the paths tried, from the resolved PATH.
+        reason = os.strerror(exc.errno) if exc.errno else "launch failed"
+        die(f"cannot run {argv[0]}: {reason}", 127)
 
 
 def cmd_inject(argv: list[str]) -> int:
