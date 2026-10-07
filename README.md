@@ -90,6 +90,40 @@ process's argv:
 passh run --env-file=<(echo 'MY_TOKEN=op://Vault/item/field') -- some-command
 ```
 
+### Env files
+
+The env file is parsed *before* anything is resolved, and resolved secrets are
+spliced into the parsed values afterwards. A secret's own bytes are never
+parsed, so newlines (a PEM key), quotes, `=`, `#` and `$` in a secret reach the
+child exactly as stored, trailing newline included.
+
+```bash
+# Comments and blank lines are ignored.
+export TOKEN=op://Vault/item/token          # `export ` is optional
+GH_TOKEN=op://Private/Github agent/Token    # a value starting op:// is one reference, spaces and all
+KEY="op://Vault/deploy key/private key"     # quotes are removed; multiline secrets arrive intact
+URL="postgres://app:{{ op://Vault/db/password }}@db:5432/app"   # inside other text, use {{ }}
+GREETING="hello\nworld"                     # double quotes: \n \r \t \" \\ escapes
+RAW='no \n escapes, $HOME stays literal'    # single quotes: literal
+```
+
+- One `KEY=value` per line. Names are `[A-Za-z_][A-Za-z0-9_]*`. The last
+  assignment to a key wins.
+- Unquoted values are trimmed; ` #` (whitespace, then `#`) starts a comment.
+- `'...'` and `"..."` may span lines. Single quotes are literal. Double quotes
+  understand `\n`, `\r`, `\t`, `\"` and `\\`; any other backslash is kept as
+  written. Only a comment may follow the closing quote.
+- A value that starts with `op://` is a whole reference. Anywhere else, write
+  the reference as `{{ op://... }}`; a bare `op://` inside other text is an
+  error rather than a guess.
+- Nothing is interpolated: no `$VAR`, no command substitution. Literal text
+  never leaves this machine — only the references go to `op inject`, all in one
+  call — so op's own template variables do not apply to it either.
+- CRLF line endings in the env file are read as LF.
+
+Anything malformed stops passh before `op` is called and before the command
+runs. Errors name the line and key, never a value.
+
 To find out what an item holds without pulling any of it across, use
 `passh fields`:
 
@@ -188,8 +222,10 @@ Note that the blocklist below applies to the tunnel, not to the fallback: once
   already exported.
 - `op run` cannot be forwarded as-is — it would launch your command on the
   laptop. `passh run` resolves the env-file remotely and execs the command
-  locally instead. Same contract, split across the hop.
-- Env values containing newlines are not supported by `passh run`'s parser.
+  locally instead. The env file format above is a subset of `op run`'s: no
+  variable expansion, and only references named in the env file are resolved
+  (not `op://` values already in the environment). Output is not masked;
+  `--no-masking` is accepted and ignored.
 - One tunnel per port. A second concurrent SSH session logs a port-in-use
   warning and reuses the first tunnel, which is harmless.
 
