@@ -133,9 +133,8 @@ If `op inject` fails, `passh run` shows none of op's output — stdout or stderr
 since an error message could quote something it resolved — and exits with op's
 exit code. It prints a fixed message instead: a specific hint when op reported
 that it is not signed in or that the unlock prompt timed out, and otherwise a
-pointer to `passh doctor` and `passh fields`. To see op's own error, run
-`passh doctor`, or reproduce the failure with `passh inject` in a terminal you
-trust.
+pointer to `passh doctor` and `passh fields`, which check the link, sign-in
+and references without fetching any values.
 
 To find out what an item holds without pulling any of it across, use
 `passh fields`:
