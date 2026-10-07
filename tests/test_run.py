@@ -149,6 +149,12 @@ def leaked(proc: subprocess.CompletedProcess) -> bool:
     return False
 
 
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 @pytest.fixture
 def h(tmp_path: Path) -> Harness:
     return Harness(tmp_path)
@@ -451,11 +457,73 @@ def test_unexpected_op_output_fails_closed(h: Harness, mode: str) -> None:
     check(b"could not map" in stderr, "unexpected error message")
 
 
-def test_op_failure_never_echoes_its_stdout(h: Harness) -> None:
-    stderr = h.refused(
-        "PEM=op://v/i/pem\nA=op://v/i/plain\n", env={"FAKE_OP_FAIL": "1"}
+SIGNIN_HINT = b"op is not signed in"
+TIMEOUT_HINT = b"1Password was not unlocked in time"
+
+
+def check_op_failure(proc: subprocess.CompletedProcess, h: Harness, kind: str) -> None:
+    """op failed with values in its stderr and stdout; none may get out."""
+    rc = fake_op.FAILURES[kind][0]
+    check(proc.returncode == rc, f"rc={proc.returncode}, want {rc}")
+    check(not h.report.exists(), "the child ran anyway")
+    check(not leaked(proc), "a secret from op's output appeared in passh's output")
+    check(b"op inject" not in proc.stdout, "diagnostics belong on stderr")
+    check(f"op inject failed (exit {rc})".encode() in proc.stderr, "no fixed message")
+    check(b"[ERROR]" not in proc.stderr, "op's raw stderr was forwarded")
+    check((SIGNIN_HINT in proc.stderr) == (kind == "signin"), "sign-in hint wrong")
+    check((TIMEOUT_HINT in proc.stderr) == (kind == "timeout"), "timeout hint wrong")
+
+
+FAILING = "PEM=op://v/i/pem\nA=op://v/i/plain\nB=op://v/i/smuggle\n"
+
+
+@pytest.mark.parametrize("kind", list(fake_op.FAILURES))
+def test_op_failure_output_is_suppressed_locally(h: Harness, kind: str) -> None:
+    proc = h.run(FAILING, env={"FAKE_OP_FAIL": kind})
+    check_op_failure(proc, h, kind)
+
+
+@pytest.mark.parametrize("kind", list(fake_op.FAILURES))
+def test_op_failure_output_is_suppressed_in_fallback(h: Harness, kind: str) -> None:
+    port = free_port()
+    token = h.tmp / "token"
+    token.write_text("unused")
+    proc = h.run(
+        FAILING,
+        env={
+            "FAKE_OP_FAIL": kind,
+            "PASSH_MODE": "remote",
+            "PASSH_PORT": str(port),
+            "PASSH_TOKEN_FILE": str(token),
+        },
     )
-    check(b"simulated failure" in stderr, "op's diagnostic was not shown")
+    check(b"Falling back" in proc.stderr, "no fallback notice")
+    check_op_failure(proc, h, kind)
+
+
+@pytest.mark.parametrize("kind", list(fake_op.FAILURES))
+def test_op_failure_output_is_suppressed_over_the_tunnel(h: Harness, kind: str) -> None:
+    FakePasshd.calls = []
+    FakePasshd.fail = kind
+    server = HTTPServer(("127.0.0.1", 0), FakePasshd)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    token = h.tmp / "token"
+    token.write_text(FakePasshd.token)
+    try:
+        proc = h.run(
+            FAILING,
+            env={
+                "PASSH_MODE": "remote",
+                "PASSH_PORT": str(server.server_port),
+                "PASSH_TOKEN_FILE": str(token),
+            },
+        )
+    finally:
+        server.shutdown()
+        FakePasshd.fail = ""
+    check(len(FakePasshd.calls) == 1, "passhd was not called once")
+    check(h.op_calls() == [], "local op ran although the tunnel was up")
+    check_op_failure(proc, h, kind)
 
 
 def test_unresolved_reference_fails_without_running_child(h: Harness) -> None:
@@ -524,6 +592,7 @@ def test_child_exit_code_is_propagated(h: Harness) -> None:
 
 class FakePasshd(BaseHTTPRequestHandler):
     token = "test-token"
+    fail = ""
     calls: ClassVar[list[list[str]]] = []
 
     def log_message(self, fmt: str, *args: object) -> None:
@@ -535,7 +604,10 @@ class FakePasshd(BaseHTTPRequestHandler):
         FakePasshd.calls.append(req["args"])
         stdin = base64.b64decode(req["stdin"] or "")
         try:
-            rc, out, err = 0, fake_op.inject(stdin, SECRETS), b""
+            if self.fail:
+                rc, out, err = fake_op.failure(self.fail, stdin, SECRETS)
+            else:
+                rc, out, err = 0, fake_op.inject(stdin, SECRETS), b""
         except fake_op.Unresolved as exc:
             rc, out, err = 1, b"", f"[ERROR] could not resolve {exc}\n".encode()
         body = json.dumps(

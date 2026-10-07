@@ -34,6 +34,35 @@ def inject(template: bytes, secrets: dict[str, str]) -> bytes:
     return REFERENCE.sub(lambda m: resolve(m.group(1) or m.group(2)), template)
 
 
+# How a failing op might look: a recognisable message, then — the worst case
+# passh has to survive — resolved values in both stderr and stdout.
+FAILURES = {
+    "generic": (3, b"[ERROR] 2026/10/07 12:00:00 something unexpected: "),
+    "signin": (
+        1,
+        (
+            b"[ERROR] 2026/10/07 12:00:00 You are not currently signed in. "
+            b"Please run `op signin --help` for instructions\n"
+        ),
+    ),
+    "timeout": (
+        1,
+        (
+            b"[ERROR] 2026/10/07 12:00:00 error initializing client: "
+            b"authorization timeout\n"
+        ),
+    ),
+}
+
+
+def failure(
+    kind: str, template: bytes, secrets: dict[str, str]
+) -> tuple[int, bytes, bytes]:
+    rc, message = FAILURES[kind]
+    values = inject(template, secrets)
+    return rc, values, message + values
+
+
 def tamper(mode: str, template: bytes, out: bytes) -> bytes:
     first_marker = template.split(b"\n", 1)[0]
     if mode == "truncate":
@@ -64,10 +93,10 @@ def main() -> int:
         with open(os.environ["FAKE_OP_STDIN"], "wb") as fh:
             fh.write(template)
     if os.environ.get("FAKE_OP_FAIL"):
-        # Partial output plus an error, the way a failing resolver might.
-        sys.stdout.buffer.write(inject(template, secrets))
-        print("[ERROR] simulated failure", file=sys.stderr)
-        return 1
+        rc, out, err = failure(os.environ["FAKE_OP_FAIL"], template, secrets)
+        sys.stdout.buffer.write(out)
+        sys.stderr.buffer.write(err)
+        return rc
     try:
         out = inject(template, secrets)
     except Unresolved as exc:
