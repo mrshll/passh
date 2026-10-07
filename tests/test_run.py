@@ -457,8 +457,8 @@ def test_unexpected_op_output_fails_closed(h: Harness, mode: str) -> None:
     check(b"could not map" in stderr, "unexpected error message")
 
 
-SIGNIN_HINT = b"op is not signed in"
-TIMEOUT_HINT = b"1Password was not unlocked in time"
+SIGNIN_HINT = b"looks like op is not signed in"
+TIMEOUT_HINT = b"looks like 1Password was not unlocked in time"
 
 
 def check_op_failure(proc: subprocess.CompletedProcess, h: Harness, kind: str) -> None:
@@ -604,7 +604,10 @@ class FakePasshd(BaseHTTPRequestHandler):
         FakePasshd.calls.append(req["args"])
         stdin = base64.b64decode(req["stdin"] or "")
         try:
-            if self.fail:
+            if self.fail == "malformed":
+                # An unreadable reply that quotes a resolved value.
+                rc, out, err = fake_op.inject(stdin, SECRETS).decode(), b"", b""
+            elif self.fail:
                 rc, out, err = fake_op.failure(self.fail, stdin, SECRETS)
             else:
                 rc, out, err = 0, fake_op.inject(stdin, SECRETS), b""
@@ -665,6 +668,49 @@ def test_fallback_path_when_tunnel_is_down(h: Harness) -> None:
     )
     check(b"Falling back" in proc.stderr, "no fallback notice")
     check(h.op_calls() == [["inject"]], "op argv")
+
+
+def test_malformed_passhd_reply_is_not_quoted(h: Harness) -> None:
+    FakePasshd.fail = "malformed"
+    server = HTTPServer(("127.0.0.1", 0), FakePasshd)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    token = h.tmp / "token"
+    token.write_text(FakePasshd.token)
+    try:
+        h.refused(
+            FAILING,
+            env={
+                "PASSH_MODE": "remote",
+                "PASSH_PORT": str(server.server_port),
+                "PASSH_TOKEN_FILE": str(token),
+            },
+        )
+    finally:
+        server.shutdown()
+        FakePasshd.fail = ""
+
+
+def test_launch_failure_does_not_quote_a_resolved_path(h: Harness) -> None:
+    # execvpe searches the resolved PATH, and its error names what it tried.
+    path = h.tmp / "t.env"
+    path.write_text("PATH=op://v/i/path\n")
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(PASSH),
+            "run",
+            f"--env-file={path}",
+            "--",
+            "passh-test-no-such-command",
+        ],
+        env=h.env,
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    check(proc.returncode == 127, f"rc={proc.returncode}")
+    check(not leaked(proc), "the resolved PATH appeared in passh's output")
+    check(b"passh-test-no-such-command" in proc.stderr, "command not named")
 
 
 def test_no_fallback_when_disabled(h: Harness) -> None:

@@ -26,6 +26,7 @@ SECRETS = {
     "op://v/i/edges": "  leading spaces\r\nCRLF line\rlone CR\n\n\n",
     "op://v/i/looks-like-refs": "op://v/i/missing and {{ op://v/i/missing }}",
     "op://v/i/empty": "",
+    "op://v/i/path": "/nonexistent-synthetic-dir-6f1c2b",
     "op://v/i/nul": "a\x00b",
     "op://v/i/bytes": "caf\udce9",
     "op://Private/Github agent/Token": "gh-synthetic",
