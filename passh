@@ -663,6 +663,13 @@ def cmd_doctor() -> int:
         print(f"tunnel:   DOWN ({exc})")
         print(f"          Expected an SSH session from the laptop carrying:")
         print(f"              RemoteForward {PORT} 127.0.0.1:{PORT}")
+        print(f"          If you are connected, port {PORT} was probably held by an")
+        print("          older session when yours started. Reconnecting fixes plain ssh;")
+        print("          a shared connection (kitten ssh, ControlMaster) keeps the failed")
+        print("          forward until every session on it closes. Or, on the laptop:")
+        print(f"              ssh -O cancel -R {PORT}:127.0.0.1:{PORT} -S <socket> <host>")
+        print(f"              ssh -O forward -R {PORT}:127.0.0.1:{PORT} -S <socket> <host>")
+        print("          kitten ssh sockets: ls /tmp/kssh-rdir-$(id -u)/")
         print()
         if os.environ.get("PASSH_NO_FALLBACK"):
             print("fallback: disabled by PASSH_NO_FALLBACK")

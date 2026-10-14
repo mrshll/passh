@@ -729,3 +729,27 @@ def test_no_fallback_when_disabled(h: Harness) -> None:
         },
     )
     check(h.op_calls() == [], "local op ran despite PASSH_NO_FALLBACK")
+
+
+def test_doctor_tells_how_to_restore_a_tunnel_lost_to_a_held_port(h: Harness) -> None:
+    port = free_port()
+    token = h.tmp / "token"
+    token.write_text("unused")
+    proc = subprocess.run(
+        [sys.executable, str(PASSH), "doctor"],
+        env={
+            **h.env,
+            "PASSH_MODE": "remote",
+            "PASSH_PORT": str(port),
+            "PASSH_TOKEN_FILE": str(token),
+            "PASSH_NO_FALLBACK": "1",
+        },
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    out = proc.stdout.decode()
+    check(proc.returncode != 0, "doctor should fail with the tunnel down")
+    check("tunnel:   DOWN" in out, "no tunnel DOWN line")
+    check(f"ssh -O cancel -R {port}:127.0.0.1:{port}" in out, "no cancel step")
+    check(f"ssh -O forward -R {port}:127.0.0.1:{port}" in out, "no forward step")
